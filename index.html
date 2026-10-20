@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SG Checkpoint Traffic</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #fff; --text: #1c1f24; --muted: #6b7280; --line: #e3e5e8;
+    --accent: #0b6bcb; --out: #c2410c; --in: #15803d; --near: #6b7280;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111317; --card: #1b1e24; --text: #e8eaed; --muted: #9aa0a6; --line: #2c3038;
+            --accent: #5aa9ff; --out: #fb923c; --in: #4ade80; --near: #9aa0a6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 20px 16px 8px; max-width: 1200px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .status { color: var(--muted); font-size: 13px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  button { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; }
+  main { max-width: 1200px; margin: 0 auto; padding: 8px 16px 32px; }
+  section.cp { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+  .cp-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .cp-head h2 { margin: 0; font-size: 18px; }
+  .cp-head .sub { color: var(--muted); font-size: 13px; }
+  a { color: var(--accent); }
+  .map { height: 260px; border-radius: 8px; margin: 12px 0; border: 1px solid var(--line); }
+  .maplink { display: inline-block; margin: 10px 0 4px; font-weight: 600; text-decoration: none; }
+  .maplink:hover { text-decoration: underline; }
+  h3 { font-size: 14px; margin: 14px 0 8px; text-transform: uppercase; letter-spacing: .04em; }
+  h3.out { color: var(--out); } h3.in { color: var(--in); } h3.near { color: var(--near); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+  figure { margin: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg); }
+  figure img { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; }
+  figcaption { padding: 8px 10px; font-size: 13px; }
+  figcaption b { display: block; }
+  figcaption span { color: var(--muted); }
+  .empty { color: var(--muted); font-size: 13px; }
+  .err { color: #dc2626; }
+  footer { max-width: 1200px; margin: 0 auto; padding: 0 16px 24px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Singapore Checkpoint Traffic</h1>
+  <div class="status">
+    <span id="status">Loading live camera images…</span>
+    <button id="refresh">Refresh now</button>
+  </div>
+</header>
+<main id="app"></main>
+<footer>
+  Camera images: LTA Traffic Images via data.gov.sg (api.data.gov.sg/v1/transport/traffic-images), refreshed every minute.
+  Traffic colours: Google Maps.
+</footer>
+
+<script src="config.js"></script>
+<script>
+const FEED = "https://api.data.gov.sg/v1/transport/traffic-images";
+const REFRESH_MS = 60_000;
+const NEARBY_KM = 3;
+
+// Singapore's two land checkpoints. Camera IDs and directions follow LTA's camera naming.
+const CHECKPOINTS = [
+  {
+    id: "woodlands", name: "Woodlands Checkpoint", sub: "Causeway to Johor Bahru",
+    lat: 1.4456, lng: 103.7690,
+    cameras: {
+      "2701": { label: "Woodlands Causeway", dir: "out" },
+      "2704": { label: "Woodlands Flyover (towards Checkpoint)", dir: "out" },
+      "2702": { label: "Woodlands Checkpoint (towards BKE)", dir: "in" },
+    },
+  },
+  {
+    id: "tuas", name: "Tuas Checkpoint", sub: "Second Link to Johor",
+    lat: 1.3480, lng: 103.6360,
+    cameras: {
+      "4703": { label: "Tuas Second Link", dir: "out" },
+      "4713": { label: "Tuas Checkpoint", dir: "in" },
+      "4712": { label: "AYE after Tuas West Road", dir: "near" },
+    },
+  },
+];
+const DIRS = [
+  ["out", "Leaving Singapore → Johor"],
+  ["in", "Entering Singapore"],
+  ["near", "Approach roads & nearby cameras"],
+];
+
+const app = document.getElementById("app");
+const statusEl = document.getElementById("status");
+const key = (window.GOOGLE_MAPS_API_KEY || "").trim();
+
+function mapsUrl(cp) {
+  // "!5m1!1e1" turns on Google Maps' traffic layer.
+  return `https://www.google.com/maps/@${cp.lat},${cp.lng},15z/data=!5m1!1e1`;
+}
+
+function km(a, b) {
+  const R = 6371, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad, dLng = (b.lng - a.lng) * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function fmtTime(iso) {
+  return new Date(iso).toLocaleString("en-SG", { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" });
+}
+
+// Build the static skeleton once so maps aren't re-created on each refresh.
+for (const cp of CHECKPOINTS) {
+  const s = document.createElement("section");
+  s.className = "cp";
+  s.innerHTML = `
+    <div class="cp-head">
+      <div><h2>${cp.name}</h2><div class="sub">${cp.sub}</div></div>
+      <a class="maplink" href="${mapsUrl(cp)}" target="_blank" rel="noopener">Open in Google Maps (live traffic) ↗</a>
+    </div>
+    ${key ? `<div class="map" id="map-${cp.id}"></div>` : ""}
+    <div id="cams-${cp.id}"><p class="empty">Loading…</p></div>`;
+  app.appendChild(s);
+}
+
+if (key) {
+  window.initMaps = () => {
+    for (const cp of CHECKPOINTS) {
+      const map = new google.maps.Map(document.getElementById(`map-${cp.id}`), { center: { lat: cp.lat, lng: cp.lng }, zoom: 15 });
+      new google.maps.TrafficLayer().setMap(map);
+      cp.map = map;
+      for (const m of cp.markers || []) m.setMap(map);
+    }
+    plotCameraMarkers();
+  };
+  const sc = document.createElement("script");
+  sc.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&callback=initMaps`;
+  sc.async = true;
+  sc.onerror = () => statusEl.insertAdjacentHTML("beforeend", ' <span class="err">· Google Maps failed to load; check the API key.</span>');
+  document.head.appendChild(sc);
+}
+
+let lastCams = [];
+function plotCameraMarkers() {
+  if (!window.google?.maps) return;
+  for (const cp of CHECKPOINTS) {
+    if (!cp.map || cp.markers) continue;
+    cp.markers = lastCams.filter(c => c.cp === cp).map(c =>
+      new google.maps.Marker({ map: cp.map, position: { lat: c.lat, lng: c.lng }, title: `Camera ${c.id}: ${c.label}` }));
+  }
+}
+
+function card(c) {
+  return `<figure>
+    <a href="${c.image}" target="_blank" rel="noopener"><img src="${c.image}" alt="${c.label}" loading="lazy"></a>
+    <figcaption><b>${c.label}</b><span>Camera ${c.id} · ${fmtTime(c.time)}</span></figcaption>
+  </figure>`;
+}
+
+async function load() {
+  statusEl.textContent = "Refreshing…";
+  try {
+    const res = await fetch(FEED, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const item = data.items?.[0];
+    if (!item) throw new Error("No data in feed");
+
+    lastCams = [];
+    for (const cam of item.cameras) {
+      const pos = { lat: cam.location.latitude, lng: cam.location.longitude };
+      for (const cp of CHECKPOINTS) {
+        const known = cp.cameras[cam.camera_id];
+        if (!known && km(pos, cp) > NEARBY_KM) continue;
+        lastCams.push({
+          cp, id: cam.camera_id, ...pos, image: cam.image, time: cam.timestamp,
+          label: known?.label || "Nearby camera", dir: known?.dir || "near",
+        });
+      }
+    }
+
+    for (const cp of CHECKPOINTS) {
+      const mine = lastCams.filter(c => c.cp === cp);
+      const html = DIRS.map(([dir, title]) => {
+        const cams = mine.filter(c => c.dir === dir);
+        return cams.length ? `<h3 class="${dir}">${title}</h3><div class="grid">${cams.map(card).join("")}</div>` : "";
+      }).join("");
+      document.getElementById(`cams-${cp.id}`).innerHTML =
+        html || `<p class="empty">No checkpoint cameras in the feed right now. Use the Google Maps link above.</p>`;
+    }
+    plotCameraMarkers();
+    statusEl.textContent = `Images as of ${fmtTime(item.timestamp)} · auto-refresh every minute`;
+  } catch (e) {
+    statusEl.innerHTML = `<span class="err">Couldn't load camera feed (${e.message}). Retrying in a minute.</span>`;
+  }
+}
+
+document.getElementById("refresh").onclick = load;
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>
